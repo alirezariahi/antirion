@@ -102,15 +102,21 @@ async fn upstream(listener: TcpListener, calls: Arc<AtomicUsize>, asked: Arc<Mut
             let _ = calls.fetch_add(1, Ordering::SeqCst);
             // The engine is addressed by its own deployment model, never by the client's alias.
             let all = String::from_utf8_lossy(&seen).into_owned();
+            let mut low_confidence = false;
             if let Some((_, sent)) = all.split_once("\r\n\r\n")
                 && let Ok(v) = serde_json::from_str::<Value>(sent)
                 && let Some(m) = v.get("model").and_then(Value::as_str)
             {
+                low_confidence = m == "engine-low";
                 *asked.lock().unwrap() = m.to_owned();
             }
             let path = head.split(' ').nth(1).unwrap_or_default();
             let text = if path.ends_with("/systemone") {
-                answers().to_string()
+                let mut answer = answers();
+                if low_confidence {
+                    answer["answers"]["q"]["confidence"] = json!(0.05);
+                }
+                answer.to_string()
             } else {
                 json!({"id": "chatcmpl-1", "object": "chat.completion", "created": 1, "model": "up-gpt",
                     "choices": [{"index": 0, "message": {"role": "assistant", "content": "hi"},
@@ -167,11 +173,18 @@ impl Gateway {
             },
             "deployments": {
                 "engine": {"provider": "engine", "model": "engine-current"},
+                "engine-low": {"provider": "engine", "model": "engine-low"},
                 "plain": {"provider": "plain", "model": "up-gpt"},
+            },
+            "routes": {
+                "escalate": {"tree": {"type": "fallback", "children": ["engine-low", "engine"]}}
             },
             "models": {
                 "decide": {"target": {"deployment": "engine"}},
                 "chat-only": {"target": {"deployment": "plain"}},
+                "escalate": {"route": "escalate",
+                             "policies": {"resilience": {"retry": {"max_attempts": 2, "tier_retries": 0,
+                                 "retry_on_response": [{"path": "/answers/q/confidence", "below": 0.6}]}}}},
                 "reask": {"target": {"deployment": "engine"},
                           "policies": {"resilience": {"retry": {"max_attempts": 3, "tier_retries": 0,
                               "retry_on_response": [{"empty_content": true}]}}}},
@@ -444,5 +457,30 @@ async fn a_chat_empty_content_policy_lets_an_answer_through() {
     let record = gw.record(header(&headers, "x-request-id").unwrap()).await;
     assert_eq!(record["attempt_count"], 1, "{record}");
     assert_eq!(record["attempts"][0]["outcome"], "success", "{record}");
+    gw.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_low_confidence_decision_moves_to_the_next_deployment() {
+    let gw = Gateway::start("systemone-confidence").await;
+    let key = gw.key("k", json!({})).await;
+
+    let (status, headers, body) = gw.decide(&key, &decision("escalate")).await;
+    assert_eq!(status, 200, "{body}");
+    let body: Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(body["answers"]["q"]["confidence"], 0.91, "{body}");
+    assert_eq!(gw.calls.load(Ordering::SeqCst), 2);
+
+    let record = gw.record(header(&headers, "x-request-id").unwrap()).await;
+    assert_eq!(record["attempt_count"], 2, "{record}");
+    assert_eq!(
+        record["attempts"][0]["failure_class"], "low_confidence",
+        "{record}"
+    );
+    assert_eq!(record["attempts"][1]["outcome"], "success", "{record}");
+
+    let (status, health) = gw.admin("GET", "/admin/v1/runtime/deployments/engine-low").await;
+    assert_eq!(status, 200, "{health}");
+    assert_eq!(health["window"]["failures"], 0, "{health}");
     gw.stop().await;
 }
